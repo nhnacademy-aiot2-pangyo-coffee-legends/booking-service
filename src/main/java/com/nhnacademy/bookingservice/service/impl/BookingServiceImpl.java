@@ -1,6 +1,5 @@
 package com.nhnacademy.bookingservice.service.impl;
 
-import com.nhnacademy.bookingservice.common.adaptor.MeetingRoomAdaptor;
 import com.nhnacademy.bookingservice.common.adaptor.MemberAdaptor;
 import com.nhnacademy.bookingservice.common.event.BookingCancelEvent;
 import com.nhnacademy.bookingservice.common.event.BookingChangeEvent;
@@ -26,6 +25,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -47,16 +47,19 @@ public class BookingServiceImpl implements BookingService{
 
     private final BookingRepository bookingRepository;
     private final BookingChangeRepository bookingChangeRepository;
-    private final MeetingRoomAdaptor meetingRoomAdaptor;
     private final MemberAdaptor memberAdaptor;
+
+    private final RedisTemplate<String, String> redisTemplate;
+    private final String REDIS_ROOM_KEY = "room:";
+    private final String REDIS_MEMBER_KEY = "member:";
 
     @Override
     public BookingRegisterResponse register(BookingRegisterRequest request, MemberResponse memberInfo) {
 
-        MeetingRoomResponse room = getMeetingRoom(request.getRoomNo());
-
-        if(room.getMeetingRoomCapacity() < request.getAttendeeCount()) {
-            throw new MeetingRoomCapacityExceededException(room.getMeetingRoomCapacity());
+        String key = REDIS_ROOM_KEY + request.getRoomNo();
+        int roomCapacity =  Integer.parseInt((String) redisTemplate.opsForHash().get(key, "capacity"));
+        if( roomCapacity < request.getAttendeeCount()) {
+            throw new MeetingRoomCapacityExceededException(roomCapacity);
         }
 
         String code = codeGenerator.generateCode();
@@ -75,7 +78,7 @@ public class BookingServiceImpl implements BookingService{
         Booking booking = Booking.ofNewBooking(code, startDateTime, request.getAttendeeCount(), finishDateTime, memberInfo.getNo(), null, request.getRoomNo());
         bookingRepository.save(booking);
 
-        publisher.publishEvent(new BookingCreatedEvent(this, memberInfo.getEmail(), booking.getBookingNo()));
+//        publisher.publishEvent(new BookingCreatedEvent(this, memberInfo.getEmail(), booking.getBookingNo()));
 
         return new BookingRegisterResponse(booking.getBookingNo());
     }
@@ -88,8 +91,7 @@ public class BookingServiceImpl implements BookingService{
 
         checkMember(booking.getMember().getNo(), memberInfo.getNo());
 
-        MeetingRoomResponse room = getMeetingRoom(booking.getRoom().getNo());
-        booking.getRoom().setName(room.getMeetingRoomName());
+        setMeetingRoomName(booking);
 
         return booking;
     }
@@ -102,8 +104,7 @@ public class BookingServiceImpl implements BookingService{
         bookings.forEach(booking -> {
             booking.getMember().setName(memberInfo.getName());
 
-            MeetingRoomResponse room = getMeetingRoom(booking.getRoom().getNo());
-            booking.getRoom().setName(room.getMeetingRoomName());
+            setMeetingRoomName(booking);
         });
         return bookings;
     }
@@ -114,12 +115,8 @@ public class BookingServiceImpl implements BookingService{
         List<BookingResponse> bookings = bookingRepository.findBookingList(null);
 
         bookings.forEach(booking -> {
-            MemberResponse member = getMember(booking.getMember().getNo());
-            booking.getMember().setName(member.getName());
-            booking.getMember().setEmail(member.getEmail());
-
-            MeetingRoomResponse room = getMeetingRoom(booking.getRoom().getNo());
-            booking.getRoom().setName(room.getMeetingRoomName());
+            setMember(booking);
+            setMeetingRoomName(booking);
         });
         return bookings;
     }
@@ -132,8 +129,7 @@ public class BookingServiceImpl implements BookingService{
         bookings.forEach(booking -> {
             booking.getMember().setName(memberInfo.getName());
 
-            MeetingRoomResponse room = getMeetingRoom(booking.getRoom().getNo());
-            booking.getRoom().setName(room.getMeetingRoomName());
+            setMeetingRoomName(booking);
         });
 
         return bookings;
@@ -146,12 +142,8 @@ public class BookingServiceImpl implements BookingService{
         Page<BookingResponse> bookings = bookingRepository.findBookings(null, pageable);
 
         bookings.forEach(booking -> {
-            MemberResponse member = getMember(booking.getMember().getNo());
-            booking.getMember().setName(member.getName());
-            booking.getMember().setEmail(member.getEmail());
-
-            MeetingRoomResponse room = getMeetingRoom(booking.getRoom().getNo());
-            booking.getRoom().setName(room.getMeetingRoomName());
+            setMember(booking);
+            setMeetingRoomName(booking);
         });
 
         return bookings;
@@ -181,8 +173,6 @@ public class BookingServiceImpl implements BookingService{
 
         checkMember(booking.getMbNo(), memberInfo.getNo());
 
-        MeetingRoomResponse room = getMeetingRoom(request.getRoomNo());
-
         LocalDate date = LocalDate.parse(request.getDate());
         LocalTime startTime = LocalTime.parse(request.getStartTime());
         LocalTime finishTime = request.getFinishTime() != null? LocalTime.parse(request.getFinishTime()) : startTime.plusHours(1);
@@ -191,14 +181,17 @@ public class BookingServiceImpl implements BookingService{
         LocalDateTime finishDateTime = LocalDateTime.of(date, finishTime);
 
 
-        booking.update(startDateTime, request.getAttendeeCount(), finishDateTime, room.getNo());
+        booking.update(startDateTime, request.getAttendeeCount(), finishDateTime, request.getRoomNo());
+
+        String key = REDIS_ROOM_KEY + request.getRoomNo();
+        Map<Object, Object> roomCache = redisTemplate.opsForHash().entries(key);
 
         BookingChange change = bookingChangeRepository.findById(BookingChangeType.CHANGE.getId())
                 .orElseThrow(() -> new BookingChangeNotFoundException(BookingChangeType.CHANGE.getId()));
         booking.updateBookingEvent(change);
 
         publisher.publishEvent(new BookingChangeEvent(this, memberInfo.getEmail(), booking.getBookingNo()));
-        return convertBookingResponse(booking, memberInfo.getName(), room.getMeetingRoomName());
+        return convertBookingResponse(booking, memberInfo.getName(), (String) roomCache.get("name"));
     }
 
     @Override
@@ -345,11 +338,16 @@ public class BookingServiceImpl implements BookingService{
         }
     }
 
-    private MeetingRoomResponse getMeetingRoom(Long roomNo){
-        return meetingRoomAdaptor.getMeetingRoom(roomNo);
+    private void setMeetingRoomName(BookingResponse booking){
+        String key = REDIS_ROOM_KEY + booking.getRoom().getNo();
+        Map<Object, Object> roomCache = redisTemplate.opsForHash().entries(key);
+        booking.getRoom().setName((String) roomCache.get("name"));
     }
 
-    private MemberResponse getMember(Long mbNo) {
-        return memberAdaptor.getMemberByMbNo(mbNo);
+    private void setMember(BookingResponse booking){
+        String key = REDIS_MEMBER_KEY + booking.getMember().getNo();
+        Map<Object, Object> memberCache = redisTemplate.opsForHash().entries(key);
+        booking.getMember().setName((String) memberCache.get("name"));
+        booking.getMember().setEmail((String) memberCache.get("email"));
     }
 }
